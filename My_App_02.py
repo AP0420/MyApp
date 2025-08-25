@@ -30,6 +30,10 @@ if 'in_chat' not in st.session_state:
     st.session_state.in_chat = False
 if 'db_initialized' not in st.session_state:
     st.session_state.db_initialized = False
+if 'available_users' not in st.session_state:
+    st.session_state.available_users = []
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = None
 
 # Database setup
 def init_db():
@@ -40,7 +44,7 @@ def init_db():
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     
-    # Users table
+    # Users table with online status
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   username TEXT UNIQUE,
@@ -48,6 +52,7 @@ def init_db():
                   gender TEXT,
                   preference TEXT,
                   interests TEXT,
+                  online BOOLEAN DEFAULT FALSE,
                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     
     # Chat sessions table
@@ -65,6 +70,12 @@ def init_db():
                   sender_id INTEGER,
                   message TEXT,
                   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Add online status column if it doesn't exist
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN online BOOLEAN DEFAULT FALSE")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     
     conn.commit()
     conn.close()
@@ -84,8 +95,8 @@ def register_user(username, password, gender, preference, interests):
     interests_str = ','.join(interests)
     
     try:
-        c.execute("INSERT INTO users (username, password, gender, preference, interests) VALUES (?, ?, ?, ?, ?)",
-                  (username, hashed_password, gender, preference, interests_str))
+        c.execute("INSERT INTO users (username, password, gender, preference, interests, online) VALUES (?, ?, ?, ?, ?, ?)",
+                  (username, hashed_password, gender, preference, interests_str, False))
         conn.commit()
         conn.close()
         return True
@@ -104,6 +115,12 @@ def authenticate_user(username, password):
     c.execute("SELECT id, username, gender, preference, interests FROM users WHERE username = ? AND password = ?",
               (username, hashed_password))
     user = c.fetchone()
+    
+    # Mark user as online
+    if user:
+        c.execute("UPDATE users SET online = TRUE WHERE username = ?", (username,))
+        conn.commit()
+    
     conn.close()
     
     if user:
@@ -116,59 +133,134 @@ def authenticate_user(username, password):
         }
     return None
 
-# Find a matching partner
+# Mark user as offline
+def set_user_offline(user_id):
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    c.execute("UPDATE users SET online = FALSE WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+# Find a matching partner from REAL users in the database
 def find_match(current_user):
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
     
-    # For demo purposes, we'll use mock data
-    # In a real application, you would implement proper matching logic
+    # Get user's preference and gender
+    user_pref = current_user['preference']
+    user_gender = current_user['gender']
+    user_interests = current_user['interests']
     
-    # Mock partner data for demonstration
-    mock_partners = [
-        {
-            'id': 2,
-            'username': 'Anonymous',
-            'gender': 'Female',
-            'preference': 'Straight',
-            'common_interests': ['Music', 'Movies']
-        },
-        {
-            'id': 3,
-            'username': 'Anonymous',
-            'gender': 'Male',
-            'preference': 'Gay',
-            'common_interests': ['Sports', 'Fitness']
-        },
-        {
-            'id': 4,
-            'username': 'Anonymous',
-            'gender': 'Female',
-            'preference': 'Lesbian',
-            'common_interests': ['Books', 'Travel']
-        }
-    ]
-    
-    # Select a mock partner based on user preference
-    current_pref = current_user['preference']
-    if current_pref == 'Straight':
-        partner = mock_partners[0] if current_user['gender'] == 'Male' else {
-            'id': 5,
-            'username': 'Anonymous',
-            'gender': 'Male',
-            'preference': 'Straight',
-            'common_interests': ['Music', 'Travel']
-        }
-    elif current_pref == 'Gay':
-        partner = mock_partners[1]
-    elif current_pref == 'Lesbian':
-        partner = mock_partners[2]
+    # Define target gender based on preference
+    if user_pref == 'Straight':
+        if user_gender == 'Male':
+            target_gender = 'Female'
+        else:
+            target_gender = 'Male'
+    elif user_pref == 'Gay':
+        target_gender = 'Male'
+    elif user_pref == 'Lesbian':
+        target_gender = 'Female'
     else:  # Bisexual
-        partner = random.choice(mock_partners)
+        target_gender = None  # No gender restriction
+    
+    # Build query based on preference
+    if target_gender:
+        query = """
+            SELECT id, username, gender, preference, interests 
+            FROM users 
+            WHERE id != ? 
+            AND gender = ?
+            AND online = TRUE
+            AND (preference = ? OR preference = 'Bisexual')
+        """
+        params = (current_user['id'], target_gender, user_pref)
+    else:
+        # For bisexual users, match with anyone who would also match with them
+        query = """
+            SELECT id, username, gender, preference, interests 
+            FROM users 
+            WHERE id != ? 
+            AND online = TRUE
+            AND (
+                (gender = 'Male' AND (preference = 'Bisexual' OR preference = 'Gay' OR preference = 'Straight' AND gender = 'Female')) OR
+                (gender = 'Female' AND (preference = 'Bisexual' OR preference = 'Lesbian' OR preference = 'Straight' AND gender = 'Male'))
+            )
+        """
+        params = (current_user['id'],)
+    
+    c.execute(query, params)
+    potential_matches = c.fetchall()
+    
+    # Convert to list of dictionaries and calculate common interests
+    matches = []
+    for match in potential_matches:
+        match_interests = match[4].split(',') if match[4] else []
+        common_interests = set(user_interests).intersection(set(match_interests))
+        
+        matches.append({
+            'id': match[0],
+            'username': match[1],
+            'gender': match[2],
+            'preference': match[3],
+            'common_interests': list(common_interests)
+        })
+    
+    # Sort by number of common interests (most first)
+    matches.sort(key=lambda x: len(x['common_interests']), reverse=True)
     
     conn.close()
-    return partner
+    
+    # Return the best match if available
+    return matches[0] if matches else None
+
+# Start a chat session
+def start_chat_session(user1_id, user2_id):
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    c.execute("INSERT INTO chat_sessions (user1_id, user2_id, start_time) VALUES (?, ?, ?)",
+              (user1_id, user2_id, datetime.now()))
+    session_id = c.lastrowid
+    
+    conn.commit()
+    conn.close()
+    
+    return session_id
+
+# Send a message
+def send_message(session_id, sender_id, message):
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    c.execute("INSERT INTO messages (session_id, sender_id, message) VALUES (?, ?, ?)",
+              (session_id, sender_id, message))
+    
+    conn.commit()
+    conn.close()
+
+# Get chat messages
+def get_messages(session_id):
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT sender_id, message, timestamp 
+        FROM messages 
+        WHERE session_id = ? 
+        ORDER BY timestamp ASC
+    """, (session_id,))
+    
+    messages = c.fetchall()
+    conn.close()
+    
+    return messages
 
 # Initialize database
 init_db()
@@ -261,12 +353,16 @@ else:
     st.sidebar.write(f"Interests: {', '.join(st.session_state.current_user['interests'])}")
     
     if st.sidebar.button("Logout"):
+        # Mark user as offline
+        set_user_offline(st.session_state.current_user['id'])
+        
         st.session_state.logged_in = False
         st.session_state.current_user = None
         st.session_state.chat_partner = None
         st.session_state.chat_messages = []
         st.session_state.waiting_for_match = False
         st.session_state.in_chat = False
+        st.session_state.session_id = None
         st.rerun()
     
     if not st.session_state.in_chat:
@@ -281,17 +377,28 @@ else:
         if st.session_state.waiting_for_match:
             st.info("Looking for a matching partner...")
             
-            # Simulate finding a match
+            # Find a real match from the database
             with st.spinner("Searching for someone with similar interests..."):
-                time.sleep(2)
-                
-                partner = find_match(st.session_state.current_user)
+                # Try to find a match multiple times with delay
+                max_attempts = 10
+                for attempt in range(max_attempts):
+                    partner = find_match(st.session_state.current_user)
+                    if partner:
+                        break
+                    time.sleep(1)  # Wait 1 second between attempts
                 
                 if partner:
                     st.session_state.chat_partner = partner
                     st.session_state.waiting_for_match = False
                     st.session_state.in_chat = True
                     st.session_state.chat_messages = []
+                    
+                    # Start a chat session
+                    st.session_state.session_id = start_chat_session(
+                        st.session_state.current_user['id'],
+                        partner['id']
+                    )
+                    
                     st.rerun()
                 else:
                     st.error("No suitable matches found. Please try again later.")
@@ -333,6 +440,13 @@ else:
                 'text': new_message
             })
             
+            # Save message to database
+            send_message(
+                st.session_state.session_id,
+                st.session_state.current_user['id'],
+                new_message
+            )
+            
             # Simulate partner response after a short delay
             responses = [
                 "That's interesting! Tell me more.",
@@ -355,10 +469,22 @@ else:
                 'sender': 'Partner',
                 'text': random.choice(responses)
             })
+            
+            # Save partner message to database
+            send_message(
+                st.session_state.session_id,
+                partner['id'],
+                random.choice(responses)
+            )
+            
             st.rerun()
         
         if st.button("End Chat"):
+            # Mark user as offline
+            set_user_offline(st.session_state.current_user['id'])
+            
             st.session_state.chat_partner = None
             st.session_state.chat_messages = []
             st.session_state.in_chat = False
+            st.session_state.session_id = None
             st.rerun()
