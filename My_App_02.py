@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import sqlite3
 import os
@@ -30,10 +30,12 @@ if 'in_chat' not in st.session_state:
     st.session_state.in_chat = False
 if 'db_initialized' not in st.session_state:
     st.session_state.db_initialized = False
-if 'available_users' not in st.session_state:
-    st.session_state.available_users = []
 if 'session_id' not in st.session_state:
     st.session_state.session_id = None
+if 'last_message_check' not in st.session_state:
+    st.session_state.last_message_check = datetime.now()
+if 'active_sessions' not in st.session_state:
+    st.session_state.active_sessions = {}
 
 # Database setup
 def init_db():
@@ -61,7 +63,8 @@ def init_db():
                   user1_id INTEGER,
                   user2_id INTEGER,
                   start_time TIMESTAMP,
-                  end_time TIMESTAMP)''')
+                  end_time TIMESTAMP,
+                  active BOOLEAN DEFAULT TRUE)''')
     
     # Messages table
     c.execute('''CREATE TABLE IF NOT EXISTS messages
@@ -69,11 +72,31 @@ def init_db():
                   session_id INTEGER,
                   sender_id INTEGER,
                   message TEXT,
-                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+                  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  read BOOLEAN DEFAULT FALSE)''')
+    
+    # Active sessions table for matching
+    c.execute('''CREATE TABLE IF NOT EXISTS active_sessions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER,
+                  session_key TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     
     # Add online status column if it doesn't exist
     try:
         c.execute("ALTER TABLE users ADD COLUMN online BOOLEAN DEFAULT FALSE")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
+    # Add active column to chat_sessions if it doesn't exist
+    try:
+        c.execute("ALTER TABLE chat_sessions ADD COLUMN active BOOLEAN DEFAULT TRUE")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    
+    # Add read column to messages if it doesn't exist
+    try:
+        c.execute("ALTER TABLE messages ADD COLUMN read BOOLEAN DEFAULT FALSE")
     except sqlite3.OperationalError:
         pass  # Column already exists
     
@@ -244,8 +267,27 @@ def send_message(session_id, sender_id, message):
     conn.commit()
     conn.close()
 
-# Get chat messages
-def get_messages(session_id):
+# Get new messages for a session
+def get_new_messages(session_id, last_check_time):
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT sender_id, message, timestamp 
+        FROM messages 
+        WHERE session_id = ? 
+        AND timestamp > ?
+        ORDER BY timestamp ASC
+    """, (session_id, last_check_time))
+    
+    messages = c.fetchall()
+    conn.close()
+    
+    return messages
+
+# Get all messages for a session
+def get_all_messages(session_id):
     db_path = get_db_path()
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
@@ -261,6 +303,31 @@ def get_messages(session_id):
     conn.close()
     
     return messages
+
+# Check if session is still active
+def is_session_active(session_id):
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    c.execute("SELECT active FROM chat_sessions WHERE id = ?", (session_id,))
+    result = c.fetchone()
+    
+    conn.close()
+    
+    return result[0] if result else False
+
+# End a chat session
+def end_chat_session(session_id):
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    c.execute("UPDATE chat_sessions SET active = FALSE, end_time = ? WHERE id = ?",
+              (datetime.now(), session_id))
+    
+    conn.commit()
+    conn.close()
 
 # Initialize database
 init_db()
@@ -302,6 +369,12 @@ st.markdown("""
     .waiting {
         text-align: center;
         padding: 40px;
+    }
+    /* Auto-refresh styling */
+    .stAlert {
+        padding: 10px;
+        border-radius: 5px;
+        margin-bottom: 10px;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -355,6 +428,10 @@ else:
     if st.sidebar.button("Logout"):
         # Mark user as offline
         set_user_offline(st.session_state.current_user['id'])
+        
+        # End active chat session if exists
+        if st.session_state.session_id:
+            end_chat_session(st.session_state.session_id)
         
         st.session_state.logged_in = False
         st.session_state.current_user = None
@@ -414,6 +491,37 @@ else:
             st.subheader(f"Chat with: Anonymous ({partner['gender']}, {partner['preference']})")
             st.write(f"Common interests: {', '.join(partner['common_interests'])}")
         
+        # Check for new messages periodically
+        current_time = datetime.now()
+        if (current_time - st.session_state.last_message_check).seconds > 2:  # Check every 2 seconds
+            # Get new messages from the database
+            new_messages = get_new_messages(
+                st.session_state.session_id, 
+                st.session_state.last_message_check
+            )
+            
+            # Add new messages to the chat
+            for msg in new_messages:
+                sender_id, message_text, timestamp = msg
+                if sender_id == st.session_state.current_user['id']:
+                    sender = 'You'
+                else:
+                    sender = 'Partner'
+                
+                # Add message to chat if not already present
+                message_exists = any(m['text'] == message_text and m['sender'] == sender for m in st.session_state.chat_messages)
+                if not message_exists:
+                    st.session_state.chat_messages.append({
+                        'sender': sender,
+                        'text': message_text,
+                        'timestamp': timestamp
+                    })
+            
+            st.session_state.last_message_check = current_time
+        
+        # Display auto-refresh notice
+        st.info("💬 Chat is auto-refreshing every few seconds...")
+        
         # Chat container
         chat_container = st.container(height=400)
         
@@ -434,10 +542,11 @@ else:
             send_btn = st.button("Send")
         
         if send_btn and new_message:
-            # Add user message
+            # Add user message to local state
             st.session_state.chat_messages.append({
                 'sender': 'You',
-                'text': new_message
+                'text': new_message,
+                'timestamp': datetime.now()
             })
             
             # Save message to database
@@ -447,44 +556,44 @@ else:
                 new_message
             )
             
-            # Simulate partner response after a short delay
-            responses = [
-                "That's interesting! Tell me more.",
-                "I feel the same way about that.",
-                "I've never thought about it like that before.",
-                "What made you think of that?",
-                f"I also enjoy {random.choice(partner['common_interests'])}!",
-                "That's cool!",
-                "I understand what you mean.",
-                "Can you elaborate on that?",
-                "That's a unique perspective."
-            ]
+            # Update last check time
+            st.session_state.last_message_check = datetime.now()
             
-            # Add to session state and rerun to show user message immediately
+            # Clear input field
             st.rerun()
-            
-            # Add simulated response after a brief delay
-            time.sleep(1)
-            st.session_state.chat_messages.append({
-                'sender': 'Partner',
-                'text': random.choice(responses)
-            })
-            
-            # Save partner message to database
-            send_message(
-                st.session_state.session_id,
-                partner['id'],
-                random.choice(responses)
-            )
-            
+        
+        # Check if partner is still connected
+        if not is_session_active(st.session_state.session_id):
+            st.error("Your chat partner has left the conversation.")
+            time.sleep(2)
+            st.session_state.chat_partner = None
+            st.session_state.chat_messages = []
+            st.session_state.in_chat = False
+            st.session_state.session_id = None
             st.rerun()
         
         if st.button("End Chat"):
             # Mark user as offline
             set_user_offline(st.session_state.current_user['id'])
             
+            # End the chat session
+            end_chat_session(st.session_state.session_id)
+            
             st.session_state.chat_partner = None
             st.session_state.chat_messages = []
             st.session_state.in_chat = False
             st.session_state.session_id = None
             st.rerun()
+
+# Add auto-refresh JavaScript
+auto_refresh = """
+<script>
+function refreshPage() {
+    setTimeout(function() {
+        window.location.reload();
+    }, 3000); // Refresh every 3 seconds
+}
+window.onload = refreshPage;
+</script>
+"""
+html(auto_refresh)
